@@ -4,9 +4,9 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, TypeHandler
 from telegram.request import HTTPXRequest
 
 try:
@@ -150,18 +150,42 @@ def init_db():
         )
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS ignore_rules (
+        CREATE TABLE IF NOT EXISTS mutes (
+            id BIGSERIAL PRIMARY KEY,
             owner_id BIGINT NOT NULL,
             business_connection_id TEXT NOT NULL,
             chat_id BIGINT NOT NULL,
-            target_user_id BIGINT,
+            target_user_id BIGINT NOT NULL,
             target_username TEXT,
-            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            target_name TEXT,
+            expires_at TIMESTAMPTZ,
+            public_notice BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL,
-            PRIMARY KEY(owner_id, business_connection_id, chat_id)
+            UNIQUE(owner_id, business_connection_id, chat_id, target_user_id)
         )
     """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ignore_rules_owner ON ignore_rules(owner_id, enabled)")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mute_logs (
+            id BIGSERIAL PRIMARY KEY,
+            owner_id BIGINT NOT NULL,
+            business_connection_id TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            target_user_id BIGINT NOT NULL,
+            target_username TEXT,
+            target_name TEXT,
+            source_message_id BIGINT NOT NULL,
+            message_type TEXT NOT NULL,
+            text TEXT,
+            caption TEXT,
+            file_id TEXT,
+            file_unique_id TEXT,
+            file_name TEXT,
+            mime_type TEXT,
+            emoji TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            raw_json JSONB NOT NULL
+        )
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_owner_created ON messages(owner_id, created_at DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_hub_logs_created ON hub_logs(created_at DESC)")
     con.commit()
@@ -661,215 +685,234 @@ async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content
 
 
 
-def normalize_username(value):
-    value = (value or "").strip()
-    if value.startswith("@"):
-        value = value[1:]
-    return value.lower()
-
-
-def find_ignore_targets(owner_id, username):
-    wanted = normalize_username(username)
-    if not wanted:
-        return []
-    con = pg_conn()
-    cur = con.cursor()
-    cur.execute(
-        """SELECT DISTINCT business_connection_id, chat_id, sender_id, sender_username
-           FROM messages
-           WHERE owner_id=%s AND LOWER(COALESCE(sender_username,''))=%s
-           ORDER BY business_connection_id, chat_id""",
-        (owner_id, wanted),
-    )
-    rows = cur.fetchall()
-    cur.close(); con.close()
-    return rows
-
-
-def set_ignore_rule(owner_id, connection_id, chat_id, target_user_id, target_username, enabled=True):
-    con = pg_conn()
-    cur = con.cursor()
-    cur.execute(
-        """INSERT INTO ignore_rules
-           (owner_id,business_connection_id,chat_id,target_user_id,target_username,enabled,created_at)
-           VALUES(%s,%s,%s,%s,%s,%s,%s)
-           ON CONFLICT(owner_id,business_connection_id,chat_id) DO UPDATE SET
-             target_user_id=EXCLUDED.target_user_id,
-             target_username=EXCLUDED.target_username,
-             enabled=EXCLUDED.enabled,
-             created_at=EXCLUDED.created_at""",
-        (owner_id, connection_id, chat_id, target_user_id, normalize_username(target_username), enabled, now()),
-    )
-    con.commit(); cur.close(); con.close()
-
-
-def disable_ignore_rules(owner_id, username=None):
-    con = pg_conn()
-    cur = con.cursor()
+def find_owner_accounts(owner_id, username=None):
+    con = pg_conn(); cur = con.cursor()
     if username:
-        cur.execute(
-            "UPDATE ignore_rules SET enabled=FALSE WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s",
-            (owner_id, normalize_username(username)),
-        )
+        u = username.lstrip("@").lower()
+        cur.execute("""SELECT a.*, m.chat_id, m.target_user_id, m.target_username, m.target_name
+                       FROM accounts a JOIN mutes m ON m.business_connection_id=a.business_connection_id
+                       WHERE a.owner_id=%s AND LOWER(COALESCE(m.target_username,''))=%s""", (owner_id, u))
+        rows = cur.fetchall()
     else:
-        cur.execute("UPDATE ignore_rules SET enabled=FALSE WHERE owner_id=%s", (owner_id,))
-    changed = cur.rowcount
+        cur.execute("SELECT * FROM accounts WHERE owner_id=%s ORDER BY created_at DESC", (owner_id,))
+        rows = cur.fetchall()
+    cur.close(); con.close(); return rows
+
+
+def find_target_accounts(owner_id, username):
+    u = username.lstrip("@").lower()
+    con = pg_conn(); cur = con.cursor()
+    cur.execute("""SELECT DISTINCT ON (m.business_connection_id, m.chat_id)
+                   m.business_connection_id, m.chat_id, m.sender_id AS target_user_id,
+                   m.sender_username AS target_username, m.sender_name AS target_name,
+                   a.account_name, a.username AS account_username
+                   FROM messages m JOIN accounts a ON a.business_connection_id=m.business_connection_id
+                   WHERE m.owner_id=%s AND LOWER(COALESCE(m.sender_username,''))=%s
+                   ORDER BY m.business_connection_id, m.chat_id, m.created_at DESC""", (owner_id, u))
+    rows = cur.fetchall(); cur.close(); con.close(); return rows
+
+
+def get_pending_mute(owner_id):
+    con = pg_conn(); cur = con.cursor()
+    cur.execute("SELECT * FROM settings WHERE owner_id=%s AND key='pending_mute'", (owner_id,))
+    row = cur.fetchone(); cur.close(); con.close()
+    if not row: return None
+    try: return json.loads(row['value'])
+    except Exception: return None
+
+
+def set_pending_mute(owner_id, data):
+    con = pg_conn(); cur = con.cursor()
+    cur.execute("""INSERT INTO settings(owner_id,key,value) VALUES(%s,'pending_mute',%s)
+                   ON CONFLICT(owner_id,key) DO UPDATE SET value=EXCLUDED.value""", (owner_id, json.dumps(data, ensure_ascii=False)))
     con.commit(); cur.close(); con.close()
-    return changed
 
 
-def get_ignore_rules_for_message(owner_id, connection_id, chat_id, sender_id, sender_username):
-    con = pg_conn()
-    cur = con.cursor()
-    cur.execute(
-        """SELECT * FROM ignore_rules
-           WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND enabled=TRUE
-           AND (target_user_id=%s OR LOWER(COALESCE(target_username,''))=LOWER(%s))""",
-        (owner_id, connection_id, chat_id, sender_id, normalize_username(sender_username)),
-    )
-    rows = cur.fetchall()
-    cur.close(); con.close()
-    return rows
+def clear_pending_mute(owner_id):
+    con = pg_conn(); cur = con.cursor()
+    cur.execute("DELETE FROM settings WHERE owner_id=%s AND key='pending_mute'", (owner_id,))
+    con.commit(); cur.close(); con.close()
 
 
-def get_unread_candidates(owner_id, connection_id, chat_id, target_username):
-    con = pg_conn()
-    cur = con.cursor()
-    wanted = normalize_username(target_username)
-    cur.execute(
-        """SELECT * FROM messages
-           WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s
-           AND LOWER(COALESCE(sender_username,''))=%s
-           ORDER BY message_id ASC""",
-        (owner_id, connection_id, chat_id, wanted),
-    )
-    rows = cur.fetchall()
-    cur.close(); con.close()
-    return rows
+def parse_duration(value):
+    import re
+    value = value.strip().lower()
+    if not re.fullmatch(r'(?:\d+[dhms])+', value):
+        return None
+    total = 0
+    for n, unit in re.findall(r'(\d+)([dhms])', value):
+        total += int(n) * {'d':86400,'h':3600,'m':60,'s':1}[unit]
+    return total if total > 0 else None
 
 
-async def mark_business_message_read(bot, connection_id, chat_id, message_id):
-    try:
-        return await bot.read_business_message(
-            business_connection_id=connection_id,
-            chat_id=chat_id,
-            message_id=message_id,
-        )
-    except AttributeError:
-        try:
-            return await bot._post(
-                "readBusinessMessage",
-                data={
-                    "business_connection_id": connection_id,
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                },
-            )
-        except Exception as e:
-            log.error("Не вдалося позначити Business message як прочитане: %s", e)
-            return False
-    except TelegramError as e:
-        log.warning("Не вдалося позначити повідомлення %s як прочитане: %s", message_id, e)
-        return False
+def human_duration(seconds):
+    parts=[]
+    for unit, div, label in [('d',86400,'день'),('h',3600,'годин'),('m',60,'хвилин'),('s',1,'секунд')]:
+        n, seconds = divmod(seconds, div)
+        if n:
+            if unit == 'd': label = 'день' if n == 1 else ('дні' if n in (2,3,4) else 'днів')
+            parts.append(f"{n} {label}")
+    return ', '.join(parts) or '0 секунд'
 
 
-async def send_message_copy(bot, owner_chat_id, m):
-    try:
-        typ = message_type(m)
-        if typ == "text" and m.text:
-            await bot.send_message(chat_id=owner_chat_id, text=m.text)
-        elif typ == "photo" and m.photo:
-            await bot.send_photo(chat_id=owner_chat_id, photo=m.photo[-1].file_id, caption=m.caption)
-        elif typ == "video" and m.video:
-            await bot.send_video(chat_id=owner_chat_id, video=m.video.file_id, caption=m.caption)
-        elif typ == "video_note" and m.video_note:
-            await bot.send_video_note(chat_id=owner_chat_id, video_note=m.video_note.file_id)
-        elif typ == "voice" and m.voice:
-            await bot.send_voice(chat_id=owner_chat_id, voice=m.voice.file_id, caption=m.caption)
-        elif typ == "audio" and m.audio:
-            await bot.send_audio(chat_id=owner_chat_id, audio=m.audio.file_id, caption=m.caption)
-        elif typ == "document" and m.document:
-            await bot.send_document(chat_id=owner_chat_id, document=m.document.file_id, caption=m.caption)
-        elif typ == "animation" and m.animation:
-            await bot.send_animation(chat_id=owner_chat_id, animation=m.animation.file_id, caption=m.caption)
-        elif typ == "sticker" and m.sticker:
-            await bot.send_sticker(chat_id=owner_chat_id, sticker=m.sticker.file_id)
-        elif typ == "location" and m.location:
-            await bot.send_location(chat_id=owner_chat_id, latitude=m.location.latitude, longitude=m.location.longitude)
-        elif typ == "venue" and m.venue:
-            await bot.send_venue(chat_id=owner_chat_id, latitude=m.venue.location.latitude, longitude=m.venue.location.longitude, title=m.venue.title, address=m.venue.address)
+def active_mute(owner_id, connection_id, chat_id, sender_id):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""SELECT * FROM mutes WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND target_user_id=%s""",
+                (owner_id,connection_id,chat_id,sender_id))
+    row=cur.fetchone()
+    if row and row['expires_at']:
+        cur.execute("SELECT CASE WHEN expires_at <= NOW() THEN TRUE ELSE FALSE END AS expired FROM mutes WHERE id=%s", (row['id'],))
+        expired=cur.fetchone()['expired']
+        if expired:
+            cur.execute("DELETE FROM mutes WHERE id=%s", (row['id'],)); con.commit(); row=None
+    cur.close(); con.close(); return row
+
+
+def create_mute(owner_id, target, duration_seconds, public_notice):
+    expires = None
+    if duration_seconds:
+        from datetime import timedelta
+        expires = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO mutes(owner_id,business_connection_id,chat_id,target_user_id,target_username,target_name,expires_at,public_notice,created_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(owner_id,business_connection_id,chat_id,target_user_id) DO UPDATE SET
+                   target_username=EXCLUDED.target_username,target_name=EXCLUDED.target_name,expires_at=EXCLUDED.expires_at,public_notice=EXCLUDED.public_notice""",
+                (owner_id,target['business_connection_id'],target['chat_id'],target['target_user_id'],target['target_username'],target['target_name'],expires,public_notice,now()))
+    con.commit(); cur.close(); con.close()
+    return expires
+
+
+def remove_mutes(owner_id, username=None):
+    con=pg_conn(); cur=con.cursor()
+    if username:
+        cur.execute("DELETE FROM mutes WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s", (owner_id,username.lstrip('@').lower()))
+    else:
+        cur.execute("DELETE FROM mutes WHERE owner_id=%s", (owner_id,))
+    n=cur.rowcount; con.commit(); cur.close(); con.close(); return n
+
+
+def save_mute_log(owner_id, bc, m):
+    sender=m.from_user
+    file_id, unique_id, file_name, mime_type=media_info(m)
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO mute_logs(owner_id,business_connection_id,chat_id,target_user_id,target_username,target_name,source_message_id,message_type,text,caption,file_id,file_unique_id,file_name,mime_type,emoji,created_at,raw_json)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+                (owner_id,bc.id,m.chat.id,sender.id if sender else 0,sender.username if sender else None,sender.full_name if sender else None,m.message_id,message_type(m),m.text,m.caption,file_id,unique_id,file_name,mime_type,m.dice.emoji if m.dice else None,now(),json.dumps(m.to_dict(),ensure_ascii=False)))
+    con.commit(); cur.close(); con.close()
+
+
+def get_mute_logs(owner_id, username):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""SELECT * FROM mute_logs WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s ORDER BY created_at ASC""", (owner_id,username.lstrip('@').lower()))
+    rows=cur.fetchall(); cur.close(); con.close(); return rows
+
+
+async def send_mute_log_rows(bot, chat_id, rows):
+    if not rows:
+        await bot.send_message(chat_id=chat_id, text='Логів муту для цього користувача немає.')
+        return
+    await bot.send_message(chat_id=chat_id, text=f"📋 Повідомлення користувача @{rows[0]['target_username']} під час муту: {len(rows)}")
+    for row in rows:
+        typ=row['message_type']; body=row['text'] or row['caption']
+        if body:
+            await bot.send_message(chat_id=chat_id, text=body)
+        elif row['file_id']:
+            await send_deleted_media(bot, chat_id, row)
         else:
-            await bot.send_message(chat_id=owner_chat_id, text=f"Повідомлення типу {typ} отримано.")
-        return True
-    except TelegramError as e:
-        log.error("Не вдалося переслати повідомлення користувачу %s: %s", owner_chat_id, e)
-        return False
+            await bot.send_message(chat_id=chat_id, text=f"[{typ}]")
 
 
-async def ignore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or update.effective_chat.type != "private":
+async def finish_mute(bot, owner_id, pending, duration_seconds, public_notice):
+    target = pending['target']
+    bc = connections.get(target['business_connection_id'])
+    if not bc:
+        bc = await get_connection(bot, target['business_connection_id'])
+    if not bc or not bc.is_enabled:
+        await bot.send_message(chat_id=owner_id, text='Business-акаунт недоступний.')
         return
-    if not update.effective_user:
+    rights = bc.rights
+    if not rights or not getattr(rights, 'can_delete_all_messages', False):
+        await bot.send_message(chat_id=owner_id, text='Для муту потрібно надати RomaGram право «Видаляти всі повідомлення».')
         return
-    if not context.args or not normalize_username(context.args[0]):
-        await update.effective_chat.send_message("Використання: /ignore @username")
-        return
-    username = normalize_username(context.args[0])
-    owner_id = update.effective_user.id
-    targets = find_ignore_targets(owner_id, username)
+    expires=create_mute(owner_id,target,duration_seconds,public_notice)
+    clear_pending_mute(owner_id)
+    username='@'+target['target_username'] if target.get('target_username') else target.get('target_name') or f"ID {target['target_user_id']}"
+    if public_notice:
+        if bc:
+            if duration_seconds:
+                text=f"Вам було видано мут на {human_duration(duration_seconds)}!"
+            else:
+                text="Вам було видано мут!"
+            try:
+                await bot.send_message(chat_id=target['chat_id'], text=text, business_connection_id=target['business_connection_id'])
+            except TelegramError as e:
+                log.error("Не вдалося надіслати публічне повідомлення про мут: %s", e)
+    status = human_duration(duration_seconds) if duration_seconds else 'поки не буде знято'
+    await bot.send_message(chat_id=owner_id, text=f"Мут видано користувачу {username} на {status}.")
+
+
+async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private': return
+    owner_id=update.effective_user.id
+    if not context.args or not context.args[0].startswith('@'):
+        await update.effective_chat.send_message('Використання: /mute @username'); return
+    username=context.args[0].lstrip('@')
+    targets=find_target_accounts(owner_id,username)
     if not targets:
-        await update.effective_chat.send_message(f"Не знайдено збережених повідомлень від @{username}.")
+        await update.effective_chat.send_message('Не знайшов цього користувача у збережених повідомленнях. Спочатку він має надіслати хоча б одне повідомлення.')
         return
-    bc_cache = {}
-    read_count = 0
-    for target in targets:
-        connection_id = target["business_connection_id"]
-        chat_id = target["chat_id"]
-        bc = bc_cache.get(connection_id) or await get_connection(context.bot, connection_id)
-        if not bc:
-            continue
-        bc_cache[connection_id] = bc
-        if not getattr(getattr(bc, "rights", None), "can_read_messages", False):
-            log.warning("Business connection %s не має права can_read_messages", connection_id)
-            continue
-        rows = get_unread_candidates(owner_id, connection_id, chat_id, username)
-        for row in rows:
-            if await mark_business_message_read(context.bot, connection_id, chat_id, row["message_id"]):
-                read_count += 1
-    await update.effective_chat.send_message(f"Готово. Позначено прочитаними: {read_count} повідомлень від @{username}.")
+    target=dict(targets[0])
+    set_pending_mute(owner_id, {'target':target,'duration_seconds':None,'public_notice':None})
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton('Поки не буде знято',callback_data='mute_perm'),InlineKeyboardButton('На час',callback_data='mute_time')]])
+    await update.effective_chat.send_message(f"Оберіть бажану секцію для видачі муту користувачу @{username}",reply_markup=kb)
 
 
-async def ignore_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return
-    if not update.effective_user:
-        return
-    if not context.args or not normalize_username(context.args[0]):
-        await update.effective_chat.send_message("Використання: /ignore_on @username")
-        return
-    username = normalize_username(context.args[0])
-    owner_id = update.effective_user.id
-    targets = find_ignore_targets(owner_id, username)
-    if not targets:
-        await update.effective_chat.send_message(f"Не знайдено чат із @{username}. Спочатку дочекайся повідомлення від цього користувача.")
-        return
-    for target in targets:
-        set_ignore_rule(owner_id, target["business_connection_id"], target["chat_id"], target["sender_id"], target["sender_username"], True)
-    await update.effective_chat.send_message(f"Увімкнено ignore для @{username}. Нові повідомлення надсилатимуться тобі в ЛС без позначення прочитаними.")
+async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private': return
+    owner_id=update.effective_user.id
+    username=context.args[0] if context.args else None
+    n=remove_mutes(owner_id,username)
+    await update.effective_chat.send_message(f"Мут знято: {n}.")
 
 
-async def ignore_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or update.effective_chat.type != "private":
-        return
-    if not update.effective_user:
-        return
-    username = context.args[0] if context.args else None
-    changed = disable_ignore_rules(update.effective_user.id, username)
-    if username:
-        await update.effective_chat.send_message(f"Ignore для @{normalize_username(username)} вимкнено. Активних правил змінено: {changed}.")
-    else:
-        await update.effective_chat.send_message(f"Усі ignore-правила вимкнено. Активних правил змінено: {changed}.")
+async def mute_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private': return
+    if not context.args or not context.args[0].startswith('@'):
+        await update.effective_chat.send_message('Використання: /mute_log @username'); return
+    rows=get_mute_logs(update.effective_user.id,context.args[0])
+    await send_mute_log_rows(context.bot,update.effective_chat.id,rows)
 
+
+async def mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    owner_id=q.from_user.id; pending=get_pending_mute(owner_id)
+    if not pending:
+        await q.edit_message_text('Сесія видачі муту вже завершена.'); return
+    if q.data == 'mute_perm':
+        pending['duration_seconds']=0; set_pending_mute(owner_id,pending)
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton('Публічно',callback_data='mute_public'),InlineKeyboardButton('Приватно',callback_data='mute_private')]])
+        await q.edit_message_text(f"Оберіть спосіб видачі муту користувачу @{pending['target']['target_username']}",reply_markup=kb)
+    elif q.data == 'mute_time':
+        pending['duration_seconds']='waiting'; set_pending_mute(owner_id,pending)
+        await q.edit_message_text('Введіть час муту у форматі, наприклад: 10d5h2m1s')
+    elif q.data in ('mute_public','mute_private'):
+        if pending.get('duration_seconds') == 'waiting':
+            await q.edit_message_text('Спочатку введіть тривалість муту, наприклад: 10d5h2m1s'); return
+        await finish_mute(context.bot,owner_id,pending,pending.get('duration_seconds') or 0,q.data=='mute_public')
+        await q.edit_message_text('Налаштування муту завершено.')
+
+
+async def mute_duration_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type!='private' or not update.message or not update.message.text: return False
+    owner_id=update.effective_user.id; pending=get_pending_mute(owner_id)
+    if not pending or pending.get('duration_seconds') != 'waiting': return False
+    seconds=parse_duration(update.message.text)
+    if not seconds:
+        await update.effective_chat.send_message('Невірний формат. Приклад: 10d5h2m1s'); return True
+    pending['duration_seconds']=seconds; set_pending_mute(owner_id,pending)
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton('Публічно',callback_data='mute_public'),InlineKeyboardButton('Приватно',callback_data='mute_private')]])
+    await update.effective_chat.send_message('Оберіть спосіб видачі муту:',reply_markup=kb); return True
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.type != "private":
@@ -955,6 +998,15 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not owner_id:
                 return
             account_name = account_name_for(bc)
+            mute = active_mute(owner_id, connection_id, m.chat.id, m.from_user.id if m.from_user else 0)
+            if mute:
+                save_mute_log(owner_id, bc, m)
+                try:
+                    await context.bot.delete_business_messages(business_connection_id=connection_id, message_ids=[m.message_id])
+                    log.info("Мут: повідомлення %s користувача %s видалено", m.message_id, m.from_user.id if m.from_user else None)
+                except TelegramError as e:
+                    log.error("Мут активний, але не вдалося видалити message_id=%s: %s", m.message_id, e)
+                return
             ephemeral = is_ephemeral_message(m)
             if ephemeral:
                 ok = save_ephemeral_message(owner_id, bc, account_name, m)
@@ -969,14 +1021,6 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 ok = save_message(owner_id, connection_id, m)
             save_hub_log(bc, account_name, m)
-            ignore_rules = get_ignore_rules_for_message(
-                owner_id, connection_id, m.chat.id,
-                m.from_user.id if m.from_user else None,
-                m.from_user.username if m.from_user else None,
-            )
-            for rule in ignore_rules:
-                if m.message_id:
-                    await send_message_copy(context.bot, bc.user_chat_id, m)
             await send_hub_message(context.bot, bc, m, account_name)
             log.info("Business message: connection=%s account=%s chat=%s message_id=%s type=%s saved=%s hub=%s text=%r", connection_id, account_name, m.chat.id, m.message_id, message_type(m), ok, HUB_CHAT_ID, m.text or m.caption)
             return
@@ -1055,10 +1099,12 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_command), group=0)
-    app.add_handler(CommandHandler("ignore", ignore_command), group=0)
-    app.add_handler(CommandHandler("ignore_on", ignore_on_command), group=0)
-    app.add_handler(CommandHandler("ignore_off", ignore_off_command), group=0)
+    app.add_handler(CommandHandler("mute", mute_command), group=0)
+    app.add_handler(CommandHandler("unmute", unmute_command), group=0)
+    app.add_handler(CommandHandler("mute_log", mute_log_command), group=0)
+    app.add_handler(CallbackQueryHandler(mute_callback, pattern=r"^mute_(?:perm|time|public|private)$"), group=0)
     app.add_handler(TypeHandler(Update, handle_update), group=1)
+    app.add_handler(TypeHandler(Update, mute_duration_message), group=2)
 
     allowed = [
         "message",
