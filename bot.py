@@ -553,55 +553,67 @@ async def send_hub_message(bot, bc, m, account_name):
 
     sender = m.from_user
     account_user = bc.user
-    sender_tag = f"@{sender.username}" if sender and sender.username else (sender.full_name if sender else str(m.chat.id))
-    chat_tag = f"@{m.chat.username}" if getattr(m.chat, "username", None) else sender_tag
+    def tag(user):
+        if user and getattr(user, "username", None):
+            return f"@{user.username}"
+        if user and getattr(user, "full_name", None):
+            return user.full_name
+        if user and getattr(user, "id", None):
+            return f"ID {user.id}"
+        return "невідомий користувач"
+    if sender and account_user and sender.id == account_user.id:
+        sender_tag = tag(account_user)
+        recipient_tag = tag(m.chat) if getattr(m.chat, "username", None) or getattr(m.chat, "first_name", None) else f"ID {m.chat.id}"
+    else:
+        sender_tag = tag(sender)
+        recipient_tag = tag(account_user) if account_user else f"ID {bc.user_chat_id}"
     label = message_type(m)
     content = m.text or m.caption or ""
 
     try:
         if label == "text":
             text = (
-                f'Користувач {sender_tag} надіслав повідомлення "{content}"\n'
-                f"Вміст повідомлення:\n{content}"
+                f'Користувач {sender_tag} надіслав повідомлення користувачу {recipient_tag}\n'
+                f"Вміст повідомлення: {content}"
             )
             await bot.send_message(chat_id=HUB_CHAT_ID, text=text)
         elif label == "photo" and m.photo:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав фотографію.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав фотографію користувачу {recipient_tag}.")
             await bot.send_photo(chat_id=HUB_CHAT_ID, photo=m.photo[-1].file_id, caption=content or None)
         elif label == "video" and m.video:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав відео.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав відео користувачу {recipient_tag}.")
             await bot.send_video(chat_id=HUB_CHAT_ID, video=m.video.file_id, caption=content or None)
         elif label == "video_note" and m.video_note:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав кружечок.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав кружечок користувачу {recipient_tag}.")
             await bot.send_video_note(chat_id=HUB_CHAT_ID, video_note=m.video_note.file_id)
         elif label == "voice" and m.voice:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав голосове повідомлення.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав голосове повідомлення користувачу {recipient_tag}.")
             await bot.send_voice(chat_id=HUB_CHAT_ID, voice=m.voice.file_id, caption=content or None)
         elif label == "audio" and m.audio:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав аудіо.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав аудіо користувачу {recipient_tag}.")
             await bot.send_audio(chat_id=HUB_CHAT_ID, audio=m.audio.file_id, caption=content or None)
         elif label == "document" and m.document:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав файл.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав файл користувачу {recipient_tag}.")
             await bot.send_document(chat_id=HUB_CHAT_ID, document=m.document.file_id, caption=content or None)
         elif label == "animation" and m.animation:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав GIF-анімацію.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав GIF-анімацію користувачу {recipient_tag}.")
             await bot.send_animation(chat_id=HUB_CHAT_ID, animation=m.animation.file_id, caption=content or None)
         elif label == "sticker" and m.sticker:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав наліпку.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав наліпку користувачу {recipient_tag}.")
             await bot.send_sticker(chat_id=HUB_CHAT_ID, sticker=m.sticker.file_id)
         elif label == "dice" and m.dice:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав емоджі {m.dice.emoji}.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав емоджі користувачу {recipient_tag}.")
         elif label == "contact" and m.contact:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав контакт.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав контакт користувачу {recipient_tag}.")
             await bot.send_contact(chat_id=HUB_CHAT_ID, phone_number=m.contact.phone_number, first_name=m.contact.first_name, last_name=m.contact.last_name, vcard=m.contact.vcard)
         elif label == "location" and m.location:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав геолокацію.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав геолокацію користувачу {recipient_tag}.")
             await bot.send_location(chat_id=HUB_CHAT_ID, latitude=m.location.latitude, longitude=m.location.longitude)
         elif label == "venue" and m.venue:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав місце.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав місце користувачу {recipient_tag}.")
             await bot.send_venue(chat_id=HUB_CHAT_ID, latitude=m.venue.location.latitude, longitude=m.venue.location.longitude, title=m.venue.title, address=m.venue.address, foursquare_id=m.venue.foursquare_id, foursquare_type=m.venue.foursquare_type, google_place_id=m.venue.google_place_id, google_place_type=m.venue.google_place_type)
         else:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав повідомлення типу {label}.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав повідомлення типу {label} користувачу {recipient_tag}.")
     except TelegramError as e:
         log.error("Не вдалося переслати повідомлення в HUB %s: %s", HUB_CHAT_ID, e)
 
@@ -808,6 +820,12 @@ def get_mute_logs(owner_id, username):
     rows=cur.fetchall(); cur.close(); con.close(); return rows
 
 
+def is_mute_log_message(owner_id, connection_id, chat_id, message_id):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("SELECT 1 FROM mute_logs WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND source_message_id=%s LIMIT 1", (owner_id, connection_id, chat_id, message_id))
+    row=cur.fetchone(); cur.close(); con.close(); return bool(row)
+
+
 async def send_mute_log_rows(bot, chat_id, rows):
     if not rows:
         await bot.send_message(chat_id=chat_id, text='Логів муту для цього користувача немає.')
@@ -1000,6 +1018,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account_name = account_name_for(bc)
             mute = active_mute(owner_id, connection_id, m.chat.id, m.from_user.id if m.from_user else 0)
             if mute:
+                save_message(owner_id, connection_id, m)
                 save_mute_log(owner_id, bc, m)
                 try:
                     await context.bot.delete_business_messages(business_connection_id=connection_id, message_ids=[m.message_id])
@@ -1037,6 +1056,8 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             chat_id = deleted.chat.id
             for message_id in deleted.message_ids:
+                if is_mute_log_message(owner_id, connection_id, chat_id, message_id):
+                    continue
                 row = get_saved(owner_id, connection_id, chat_id, message_id)
                 if row:
                     notice = format_deleted(row, message_id)
