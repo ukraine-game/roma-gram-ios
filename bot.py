@@ -92,6 +92,23 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS message_edits (
+            id BIGSERIAL PRIMARY KEY,
+            business_connection_id TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL,
+            editor_id BIGINT,
+            editor_username TEXT,
+            editor_name TEXT,
+            old_type TEXT,
+            old_content TEXT,
+            new_type TEXT,
+            new_content TEXT,
+            edited_at TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_deletions (
             business_connection_id TEXT NOT NULL,
             owner_id BIGINT NOT NULL,
@@ -479,6 +496,94 @@ async def send_hub_message(bot, bc, m, account_name):
         log.error("Не вдалося переслати повідомлення в HUB %s: %s", HUB_CHAT_ID, e)
 
 
+def content_for_edit(m):
+    typ = message_type(m)
+    if typ == "text":
+        return m.text or ""
+    if m.caption:
+        return m.caption
+    if typ == "dice" and m.dice:
+        return f"{m.dice.emoji} (значення: {m.dice.value})"
+    names = {
+        "photo": "📷 фотографія",
+        "video": "🎬 відео",
+        "video_note": "🔘 кружечок",
+        "voice": "🎙️ голосове повідомлення",
+        "audio": "🎵 аудіо",
+        "document": "📎 файл",
+        "animation": "🎞️ GIF-анімація",
+        "sticker": "🧩 наліпка",
+        "contact": "👤 контакт",
+        "location": "📍 геолокація",
+        "venue": "📍 місце",
+        "poll": "📊 опитування",
+        "game": "🎮 гра",
+        "story": "📖 історія",
+    }
+    return names.get(typ, "повідомлення")
+
+
+def save_edit_log(bc, account_name, m, old_row):
+    sender = m.from_user
+    old_content = (old_row["text"] or old_row["caption"] or "") if old_row else ""
+    new_content = content_for_edit(m)
+    old_type = old_row["message_type"] if old_row else None
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO message_edits
+        (business_connection_id,account_name,chat_id,message_id,editor_id,editor_username,editor_name,old_type,old_content,new_type,new_content,edited_at)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (bc.id, account_name, m.chat.id, m.message_id,
+         sender.id if sender else None, sender.username if sender else None,
+         sender.full_name if sender else None, old_type, old_content,
+         message_type(m), new_content, now()),
+    )
+    con.commit(); cur.close(); con.close()
+    return old_content, new_content
+
+
+async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
+    account_user = bc.user
+    account_tag = f"@{account_user.username}" if account_user and account_user.username else (account_user.full_name if account_user else str(bc.user_chat_id))
+    editor = m.from_user
+    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else "Невідомий користувач")
+    chat_user = m.chat
+    recipient_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
+    is_outgoing = bool(editor and account_user and editor.id == account_user.id)
+    try:
+        if is_outgoing:
+            text = (f"✏️ LOGS\n\nАкаунт {account_tag} ({account_name}) змінив повідомлення для користувача {recipient_tag}.\n"
+                    f"Було: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
+        else:
+            text = (f"✏️ LOGS\n\nКористувач {editor_tag} змінив повідомлення на акаунті {account_tag} ({account_name}).\n"
+                    f"Чат: {recipient_tag}\nБуло: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
+        await bot.send_message(chat_id=HUB_CHAT_ID, text=text)
+    except TelegramError as e:
+        log.error("Не вдалося надіслати edit log у HUB: %s", e)
+
+
+async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content):
+    account_user = bc.user
+    account_tag = f"@{account_user.username}" if account_user and account_user.username else (account_user.full_name if account_user else str(bc.user_chat_id))
+    editor = m.from_user
+    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else "Невідомий користувач")
+    chat_user = m.chat
+    recipient_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
+    is_outgoing = bool(editor and account_user and editor.id == account_user.id)
+    if is_outgoing:
+        text = (f"✏️ Повідомлення змінено\n\nАкаунт: {account_tag} ({account_name})\n"
+                f"Кому: {recipient_tag}\nБуло: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
+    else:
+        text = (f"✏️ Користувач {editor_tag} змінив повідомлення.\n\n"
+                f"На акаунті: {account_tag} ({account_name})\nЧат: {recipient_tag}\n"
+                f"Було: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
+    try:
+        await bot.send_message(chat_id=bc.user_chat_id, text=text)
+    except TelegramError as e:
+        log.error("Не вдалося надіслати edit log власнику %s: %s", bc.user_chat_id, e)
+
+
 async def get_connection(bot, connection_id):
     bc = connections.get(connection_id)
     if bc and bc.is_enabled:
@@ -509,6 +614,26 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cur.execute("INSERT INTO settings(owner_id,key,value) VALUES(%s,%s,%s) ON CONFLICT(owner_id,key) DO UPDATE SET value=EXCLUDED.value", (owner_id, "user_chat_id", str(bc.user_chat_id)))
                     con.commit(); cur.close(); con.close()
                 log.info("Business connection: id=%s account=%s enabled=%s owner=%s user_chat_id=%s", bc.id, account_name, bc.is_enabled, bc.user.id if bc.user else None, bc.user_chat_id)
+            return
+
+        edited = update.edited_business_message
+        if edited is not None:
+            connection_id = edited.business_connection_id
+            if not connection_id or not edited.chat or edited.chat.type != "private":
+                return
+            bc = await get_connection(context.bot, connection_id)
+            if not bc:
+                return
+            owner_id = bc.user.id if bc.user else bc.user_chat_id
+            if not owner_id:
+                return
+            account_name = account_name_for(bc)
+            old_row = get_saved(owner_id, connection_id, edited.chat.id, edited.message_id)
+            old_content, new_content = save_edit_log(bc, account_name, edited, old_row)
+            save_message(owner_id, connection_id, edited)
+            await send_edit_owner_log(context.bot, bc, account_name, edited, old_content, new_content)
+            await send_edit_hub_log(context.bot, bc, account_name, edited, old_content, new_content)
+            log.info("Edited business message: connection=%s account=%s chat=%s message_id=%s", connection_id, account_name, edited.chat.id, edited.message_id)
             return
 
         m = update.business_message
