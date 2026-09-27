@@ -109,6 +109,29 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS ephemeral_messages (
+            id BIGSERIAL PRIMARY KEY,
+            business_connection_id TEXT NOT NULL,
+            owner_id BIGINT NOT NULL,
+            account_name TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT,
+            ephemeral_message_id BIGINT,
+            sender_id BIGINT,
+            sender_username TEXT,
+            sender_name TEXT,
+            message_type TEXT NOT NULL,
+            text TEXT,
+            caption TEXT,
+            file_id TEXT,
+            file_unique_id TEXT,
+            file_name TEXT,
+            mime_type TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            raw_json JSONB NOT NULL
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS pending_deletions (
             business_connection_id TEXT NOT NULL,
             owner_id BIGINT NOT NULL,
@@ -420,6 +443,63 @@ async def send_deleted_media(bot, owner_chat_id, row):
         return False
 
 
+def is_ephemeral_message(m):
+    return bool(getattr(m, "ephemeral_message_id", None)) or getattr(m, "message_id", None) == 0
+
+
+def save_ephemeral_message(owner_id, bc, account_name, m):
+    if not m.chat or m.chat.type != "private":
+        return False
+    sender = m.from_user
+    file_id, unique_id, file_name, mime_type = media_info(m)
+    raw = m.to_dict()
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO ephemeral_messages
+        (business_connection_id,owner_id,account_name,chat_id,message_id,ephemeral_message_id,
+         sender_id,sender_username,sender_name,message_type,text,caption,file_id,file_unique_id,
+         file_name,mime_type,created_at,raw_json)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)""",
+        (bc.id, owner_id, account_name, m.chat.id, m.message_id,
+         getattr(m, "ephemeral_message_id", None), sender.id if sender else None,
+         sender.username if sender else None, sender.full_name if sender else None,
+         message_type(m), m.text, m.caption, file_id, unique_id, file_name, mime_type,
+         now(), json.dumps(raw, ensure_ascii=False)),
+    )
+    con.commit(); cur.close(); con.close()
+    return True
+
+
+async def send_ephemeral_copy(bot, owner_chat_id, m):
+    try:
+        typ = message_type(m)
+        if typ == "text" and m.text:
+            await bot.send_message(chat_id=owner_chat_id, text=m.text)
+        elif typ == "photo" and m.photo:
+            await bot.send_photo(chat_id=owner_chat_id, photo=m.photo[-1].file_id, caption=m.caption)
+        elif typ == "video" and m.video:
+            await bot.send_video(chat_id=owner_chat_id, video=m.video.file_id, caption=m.caption)
+        elif typ == "video_note" and m.video_note:
+            await bot.send_video_note(chat_id=owner_chat_id, video_note=m.video_note.file_id)
+        elif typ == "voice" and m.voice:
+            await bot.send_voice(chat_id=owner_chat_id, voice=m.voice.file_id, caption=m.caption)
+        elif typ == "audio" and m.audio:
+            await bot.send_audio(chat_id=owner_chat_id, audio=m.audio.file_id, caption=m.caption)
+        elif typ == "document" and m.document:
+            await bot.send_document(chat_id=owner_chat_id, document=m.document.file_id, caption=m.caption)
+        elif typ == "animation" and m.animation:
+            await bot.send_animation(chat_id=owner_chat_id, animation=m.animation.file_id, caption=m.caption)
+        elif typ == "sticker" and m.sticker:
+            await bot.send_sticker(chat_id=owner_chat_id, sticker=m.sticker.file_id)
+        else:
+            await bot.send_message(chat_id=owner_chat_id, text=f"⚡ Тимчасове повідомлення отримано (тип: {typ}), але Telegram не передав копію, яку можна переслати.")
+        return True
+    except TelegramError as e:
+        log.error("Не вдалося зберегти/переслати тимчасове повідомлення: %s", e)
+        return False
+
+
 async def send_hub_message(bot, bc, m, account_name):
     if not m.chat or m.chat.id == HUB_CHAT_ID:
         return
@@ -564,20 +644,15 @@ async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
 
 
 async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content):
-    account_user = bc.user
-    account_tag = f"@{account_user.username}" if account_user and account_user.username else (account_user.full_name if account_user else str(bc.user_chat_id))
-    editor = m.from_user
-    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else "Невідомий користувач")
     chat_user = m.chat
-    recipient_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
-    is_outgoing = bool(editor and account_user and editor.id == account_user.id)
-    if is_outgoing:
-        text = (f"✏️ Повідомлення змінено\n\nАкаунт: {account_tag} ({account_name})\n"
-                f"Кому: {recipient_tag}\nБуло: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
-    else:
-        text = (f"✏️ Користувач {editor_tag} змінив повідомлення.\n\n"
-                f"На акаунті: {account_tag} ({account_name})\nЧат: {recipient_tag}\n"
-                f"Було: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
+    chat_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
+    old_text = old_content or "[без тексту]"
+    new_text = new_content or "[без тексту]"
+    text = (
+        f"Було змінено повідомлення в чаті {chat_tag}\n\n"
+        f"До: \"{old_text}\"\n\n"
+        f"Після: \"{new_text}\""
+    )
     try:
         await bot.send_message(chat_id=bc.user_chat_id, text=text)
     except TelegramError as e:
@@ -648,8 +723,20 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             owner_id = bc.user.id if bc.user else bc.user_chat_id
             if not owner_id:
                 return
-            ok = save_message(owner_id, connection_id, m)
             account_name = account_name_for(bc)
+            ephemeral = is_ephemeral_message(m)
+            if ephemeral:
+                ok = save_ephemeral_message(owner_id, bc, account_name, m)
+                try:
+                    await context.bot.send_message(
+                        chat_id=bc.user_chat_id,
+                        text=f"⚡ Отримано тимчасове повідомлення в чаті @{m.chat.username}" if getattr(m.chat, "username", None) else "⚡ Отримано тимчасове повідомлення."
+                    )
+                    await send_ephemeral_copy(context.bot, bc.user_chat_id, m)
+                except TelegramError as e:
+                    log.error("Не вдалося надіслати тимчасове повідомлення власнику: %s", e)
+            else:
+                ok = save_message(owner_id, connection_id, m)
             save_hub_log(bc, account_name, m)
             await send_hub_message(context.bot, bc, m, account_name)
             log.info("Business message: connection=%s account=%s chat=%s message_id=%s type=%s saved=%s hub=%s text=%r", connection_id, account_name, m.chat.id, m.message_id, message_type(m), ok, HUB_CHAT_ID, m.text or m.caption)
