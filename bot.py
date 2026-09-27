@@ -149,6 +149,19 @@ def init_db():
             PRIMARY KEY(owner_id, key)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ignore_rules (
+            owner_id BIGINT NOT NULL,
+            business_connection_id TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            target_user_id BIGINT,
+            target_username TEXT,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY(owner_id, business_connection_id, chat_id)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ignore_rules_owner ON ignore_rules(owner_id, enabled)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_owner_created ON messages(owner_id, created_at DESC)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_hub_logs_created ON hub_logs(created_at DESC)")
     con.commit()
@@ -647,6 +660,217 @@ async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content
         log.error("Не вдалося надіслати edit log власнику %s: %s", bc.user_chat_id, e)
 
 
+
+def normalize_username(value):
+    value = (value or "").strip()
+    if value.startswith("@"):
+        value = value[1:]
+    return value.lower()
+
+
+def find_ignore_targets(owner_id, username):
+    wanted = normalize_username(username)
+    if not wanted:
+        return []
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT DISTINCT business_connection_id, chat_id, sender_id, sender_username
+           FROM messages
+           WHERE owner_id=%s AND LOWER(COALESCE(sender_username,''))=%s
+           ORDER BY business_connection_id, chat_id""",
+        (owner_id, wanted),
+    )
+    rows = cur.fetchall()
+    cur.close(); con.close()
+    return rows
+
+
+def set_ignore_rule(owner_id, connection_id, chat_id, target_user_id, target_username, enabled=True):
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute(
+        """INSERT INTO ignore_rules
+           (owner_id,business_connection_id,chat_id,target_user_id,target_username,enabled,created_at)
+           VALUES(%s,%s,%s,%s,%s,%s,%s)
+           ON CONFLICT(owner_id,business_connection_id,chat_id) DO UPDATE SET
+             target_user_id=EXCLUDED.target_user_id,
+             target_username=EXCLUDED.target_username,
+             enabled=EXCLUDED.enabled,
+             created_at=EXCLUDED.created_at""",
+        (owner_id, connection_id, chat_id, target_user_id, normalize_username(target_username), enabled, now()),
+    )
+    con.commit(); cur.close(); con.close()
+
+
+def disable_ignore_rules(owner_id, username=None):
+    con = pg_conn()
+    cur = con.cursor()
+    if username:
+        cur.execute(
+            "UPDATE ignore_rules SET enabled=FALSE WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s",
+            (owner_id, normalize_username(username)),
+        )
+    else:
+        cur.execute("UPDATE ignore_rules SET enabled=FALSE WHERE owner_id=%s", (owner_id,))
+    changed = cur.rowcount
+    con.commit(); cur.close(); con.close()
+    return changed
+
+
+def get_ignore_rules_for_message(owner_id, connection_id, chat_id, sender_id, sender_username):
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute(
+        """SELECT * FROM ignore_rules
+           WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND enabled=TRUE
+           AND (target_user_id=%s OR LOWER(COALESCE(target_username,''))=LOWER(%s))""",
+        (owner_id, connection_id, chat_id, sender_id, normalize_username(sender_username)),
+    )
+    rows = cur.fetchall()
+    cur.close(); con.close()
+    return rows
+
+
+def get_unread_candidates(owner_id, connection_id, chat_id, target_username):
+    con = pg_conn()
+    cur = con.cursor()
+    wanted = normalize_username(target_username)
+    cur.execute(
+        """SELECT * FROM messages
+           WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s
+           AND LOWER(COALESCE(sender_username,''))=%s
+           ORDER BY message_id ASC""",
+        (owner_id, connection_id, chat_id, wanted),
+    )
+    rows = cur.fetchall()
+    cur.close(); con.close()
+    return rows
+
+
+async def mark_business_message_read(bot, connection_id, chat_id, message_id):
+    try:
+        return await bot.read_business_message(
+            business_connection_id=connection_id,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+    except AttributeError:
+        try:
+            return await bot._post(
+                "readBusinessMessage",
+                data={
+                    "business_connection_id": connection_id,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                },
+            )
+        except Exception as e:
+            log.error("Не вдалося позначити Business message як прочитане: %s", e)
+            return False
+    except TelegramError as e:
+        log.warning("Не вдалося позначити повідомлення %s як прочитане: %s", message_id, e)
+        return False
+
+
+async def send_message_copy(bot, owner_chat_id, m):
+    try:
+        typ = message_type(m)
+        if typ == "text" and m.text:
+            await bot.send_message(chat_id=owner_chat_id, text=m.text)
+        elif typ == "photo" and m.photo:
+            await bot.send_photo(chat_id=owner_chat_id, photo=m.photo[-1].file_id, caption=m.caption)
+        elif typ == "video" and m.video:
+            await bot.send_video(chat_id=owner_chat_id, video=m.video.file_id, caption=m.caption)
+        elif typ == "video_note" and m.video_note:
+            await bot.send_video_note(chat_id=owner_chat_id, video_note=m.video_note.file_id)
+        elif typ == "voice" and m.voice:
+            await bot.send_voice(chat_id=owner_chat_id, voice=m.voice.file_id, caption=m.caption)
+        elif typ == "audio" and m.audio:
+            await bot.send_audio(chat_id=owner_chat_id, audio=m.audio.file_id, caption=m.caption)
+        elif typ == "document" and m.document:
+            await bot.send_document(chat_id=owner_chat_id, document=m.document.file_id, caption=m.caption)
+        elif typ == "animation" and m.animation:
+            await bot.send_animation(chat_id=owner_chat_id, animation=m.animation.file_id, caption=m.caption)
+        elif typ == "sticker" and m.sticker:
+            await bot.send_sticker(chat_id=owner_chat_id, sticker=m.sticker.file_id)
+        elif typ == "location" and m.location:
+            await bot.send_location(chat_id=owner_chat_id, latitude=m.location.latitude, longitude=m.location.longitude)
+        elif typ == "venue" and m.venue:
+            await bot.send_venue(chat_id=owner_chat_id, latitude=m.venue.location.latitude, longitude=m.venue.location.longitude, title=m.venue.title, address=m.venue.address)
+        else:
+            await bot.send_message(chat_id=owner_chat_id, text=f"Повідомлення типу {typ} отримано.")
+        return True
+    except TelegramError as e:
+        log.error("Не вдалося переслати повідомлення користувачу %s: %s", owner_chat_id, e)
+        return False
+
+
+async def ignore_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    if not update.effective_user:
+        return
+    if not context.args or not normalize_username(context.args[0]):
+        await update.effective_chat.send_message("Використання: /ignore @username")
+        return
+    username = normalize_username(context.args[0])
+    owner_id = update.effective_user.id
+    targets = find_ignore_targets(owner_id, username)
+    if not targets:
+        await update.effective_chat.send_message(f"Не знайдено збережених повідомлень від @{username}.")
+        return
+    bc_cache = {}
+    read_count = 0
+    for target in targets:
+        connection_id = target["business_connection_id"]
+        chat_id = target["chat_id"]
+        bc = bc_cache.get(connection_id) or await get_connection(context.bot, connection_id)
+        if not bc:
+            continue
+        bc_cache[connection_id] = bc
+        if not getattr(getattr(bc, "rights", None), "can_read_messages", False):
+            log.warning("Business connection %s не має права can_read_messages", connection_id)
+            continue
+        rows = get_unread_candidates(owner_id, connection_id, chat_id, username)
+        for row in rows:
+            if await mark_business_message_read(context.bot, connection_id, chat_id, row["message_id"]):
+                read_count += 1
+    await update.effective_chat.send_message(f"Готово. Позначено прочитаними: {read_count} повідомлень від @{username}.")
+
+
+async def ignore_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    if not update.effective_user:
+        return
+    if not context.args or not normalize_username(context.args[0]):
+        await update.effective_chat.send_message("Використання: /ignore_on @username")
+        return
+    username = normalize_username(context.args[0])
+    owner_id = update.effective_user.id
+    targets = find_ignore_targets(owner_id, username)
+    if not targets:
+        await update.effective_chat.send_message(f"Не знайдено чат із @{username}. Спочатку дочекайся повідомлення від цього користувача.")
+        return
+    for target in targets:
+        set_ignore_rule(owner_id, target["business_connection_id"], target["chat_id"], target["sender_id"], target["sender_username"], True)
+    await update.effective_chat.send_message(f"Увімкнено ignore для @{username}. Нові повідомлення автоматично позначатимуться прочитаними та надсилатимуться тобі в ЛС.")
+
+
+async def ignore_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    if not update.effective_user:
+        return
+    username = context.args[0] if context.args else None
+    changed = disable_ignore_rules(update.effective_user.id, username)
+    if username:
+        await update.effective_chat.send_message(f"Ignore для @{normalize_username(username)} вимкнено. Активних правил змінено: {changed}.")
+    else:
+        await update.effective_chat.send_message(f"Усі ignore-правила вимкнено. Активних правил змінено: {changed}.")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or update.effective_chat.type != "private":
         return
@@ -745,6 +969,15 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 ok = save_message(owner_id, connection_id, m)
             save_hub_log(bc, account_name, m)
+            ignore_rules = get_ignore_rules_for_message(
+                owner_id, connection_id, m.chat.id,
+                m.from_user.id if m.from_user else None,
+                m.from_user.username if m.from_user else None,
+            )
+            for rule in ignore_rules:
+                if m.message_id:
+                    await mark_business_message_read(context.bot, connection_id, m.chat.id, m.message_id)
+                await send_message_copy(context.bot, bc.user_chat_id, m)
             await send_hub_message(context.bot, bc, m, account_name)
             log.info("Business message: connection=%s account=%s chat=%s message_id=%s type=%s saved=%s hub=%s text=%r", connection_id, account_name, m.chat.id, m.message_id, message_type(m), ok, HUB_CHAT_ID, m.text or m.caption)
             return
@@ -823,6 +1056,9 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start_command), group=0)
+    app.add_handler(CommandHandler("ignore", ignore_command), group=0)
+    app.add_handler(CommandHandler("ignore_on", ignore_on_command), group=0)
+    app.add_handler(CommandHandler("ignore_off", ignore_off_command), group=0)
     app.add_handler(TypeHandler(Update, handle_update), group=1)
 
     allowed = [
