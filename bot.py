@@ -21,8 +21,10 @@ DATA_DIR = os.getenv("ROMAGRAM_DATA_DIR", "data")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HUB_CHAT_ID = int(os.getenv("ROMAGRAM_HUB_CHAT_ID", "8215352323"))
-SPAM_MAX = 10000
+SPAM_MAX = 10
 INTERAVAL = 0.7
+BLOCK_F_USER_ID = 2106920885
+BLOCK_F_USERNAME = "volodumur_zelenskyi"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -189,6 +191,14 @@ def init_db():
             target_name TEXT,
             created_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY(owner_id, business_connection_id, chat_id, target_user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS function_blocks (
+            target_user_id BIGINT PRIMARY KEY,
+            target_username TEXT,
+            blocked_by BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL
         )
     """)
     cur.execute("""
@@ -781,6 +791,69 @@ def is_spam_opted_in(owner_id, connection_id, chat_id, user_id):
     row=cur.fetchone(); cur.close(); con.close(); return bool(row)
 
 
+def get_spam_test_accounts(owner_id):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("SELECT value FROM settings WHERE owner_id=%s AND key='spam_test_accounts'", (owner_id,))
+    row=cur.fetchone(); cur.close(); con.close()
+    if not row:
+        return []
+    try:
+        data=json.loads(row['value'])
+        return [str(x).lstrip('@').lower() for x in data if str(x).strip()]
+    except Exception:
+        return []
+
+
+def add_spam_test_account(owner_id, username):
+    u=username.lstrip('@').strip().lower()
+    accounts=get_spam_test_accounts(owner_id)
+    if u not in accounts:
+        accounts.append(u)
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO settings(owner_id,key,value) VALUES(%s,'spam_test_accounts',%s)
+                   ON CONFLICT(owner_id,key) DO UPDATE SET value=EXCLUDED.value""",
+                (owner_id, json.dumps(accounts, ensure_ascii=False)))
+    con.commit(); cur.close(); con.close()
+    return accounts
+
+
+def remove_spam_test_account(owner_id, username):
+    u=username.lstrip('@').strip().lower()
+    accounts=[x for x in get_spam_test_accounts(owner_id) if x != u]
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO settings(owner_id,key,value) VALUES(%s,'spam_test_accounts',%s)
+                   ON CONFLICT(owner_id,key) DO UPDATE SET value=EXCLUDED.value""",
+                (owner_id, json.dumps(accounts, ensure_ascii=False)))
+    con.commit(); cur.close(); con.close()
+    return accounts
+
+
+def is_spam_test_account(owner_id, username):
+    return username.lstrip('@').strip().lower() in get_spam_test_accounts(owner_id)
+
+
+async def setacc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user:
+        return
+    if len(context.args) != 1 or not context.args[0].startswith('@'):
+        await update.effective_chat.send_message('Використання: /setacc @username')
+        return
+    username=context.args[0].lstrip('@').strip()
+    if not username:
+        await update.effective_chat.send_message('Вкажіть username тестового акаунта.')
+        return
+    if username.lower() == BLOCK_F_USERNAME.lower():
+        await update.effective_chat.send_message(f'Цей акаунт заблокований системою: @{username}.')
+        return
+    accounts=add_spam_test_account(update.effective_user.id, username)
+    await update.effective_chat.send_message(
+        f'Тестовий акаунт @{username} додано.\n\n'
+        f'Доступні тестові акаунти: {len(accounts)}.'
+    )
+
+
 def parse_spam_count(raw):
     try:
         n=int(raw)
@@ -789,6 +862,50 @@ def parse_spam_count(raw):
     if n < 1 or n > SPAM_MAX:
         return None
     return n
+
+
+def is_function_blocked(target_user_id):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("SELECT 1 FROM function_blocks WHERE target_user_id=%s LIMIT 1", (target_user_id,))
+    row=cur.fetchone(); cur.close(); con.close()
+    return bool(row)
+
+
+def set_function_block(target_user_id, username, blocked_by):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO function_blocks(target_user_id,target_username,blocked_by,created_at)
+                   VALUES(%s,%s,%s,%s)
+                   ON CONFLICT(target_user_id) DO UPDATE SET target_username=EXCLUDED.target_username,blocked_by=EXCLUDED.blocked_by""",
+                (target_user_id, username, blocked_by, now()))
+    con.commit(); cur.close(); con.close()
+
+
+def cancel_spam_for_target(target_user_id):
+    affected=[]
+    for key, task in list(spam_tasks.items()):
+        if key[3] == target_user_id:
+            if task and not task.done():
+                task.cancel()
+            spam_tasks.pop(key, None)
+            affected.append(key[0])
+    return affected
+
+
+async def block_f_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user or update.effective_user.id != BLOCK_F_USER_ID:
+        return
+    set_function_block(BLOCK_F_USER_ID, BLOCK_F_USERNAME, update.effective_user.id)
+    affected=cancel_spam_for_target(BLOCK_F_USER_ID)
+    message=f'БЛОК. Аварійне відключення спаму, тепер на @{BLOCK_F_USERNAME} не можна кидати спам.'
+    await update.effective_chat.send_message(message)
+    for owner_id in sorted(set(affected)):
+        if owner_id != update.effective_user.id:
+            try:
+                await context.bot.send_message(chat_id=owner_id, text=message)
+            except TelegramError as e:
+                log.warning('Не вдалося повідомити власника %s про block_f: %s', owner_id, e)
 
 
 async def spam_worker(bot, owner_id, target, count, text, task_key):
@@ -817,7 +934,7 @@ async def spam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     owner_id=update.effective_user.id
     if len(context.args) < 3 or not context.args[0].startswith('@'):
-        await update.effective_chat.send_message('Використання: /spam @username 10 text\nКористувач має попередньо надіслати /spam_accept у чаті.')
+        await update.effective_chat.send_message('Використання: /spam @username 10 text\nСпочатку додайте тестовий акаунт командою /setacc @username.')
         return
     username=context.args[0].lstrip('@')
     count=parse_spam_count(context.args[1])
@@ -828,9 +945,16 @@ async def spam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.effective_chat.send_message('Текст повідомлення не може бути порожнім.')
         return
-    target=get_spam_optin_target(owner_id, username)
-    if not target:
-        await update.effective_chat.send_message('Цей користувач не підтвердив отримання повторних повідомлень. Нехай він надішле /spam_accept у чаті.')
+    if not is_spam_test_account(owner_id, username):
+        await update.effective_chat.send_message('Цей username не доданий до тестових акаунтів. Спочатку використайте /setacc @username.')
+        return
+    targets=find_target_accounts(owner_id, username)
+    if not targets:
+        await update.effective_chat.send_message('Не знайдено активного Telegram-чату з цим тестовим акаунтом. Спочатку підключіть його до Business-акаунта та отримайте від нього повідомлення.')
+        return
+    target=targets[0]
+    if is_function_blocked(target['target_user_id']):
+        await update.effective_chat.send_message(f'БЛОК. Аварійне відключення спаму, тепер на @{target["target_username"] or username} не можна кидати спам.')
         return
     task_key=(owner_id, target['business_connection_id'], target['chat_id'], target['target_user_id'])
     old=spam_tasks.get(task_key)
@@ -847,7 +971,8 @@ async def unspam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     owner_id=update.effective_user.id
     username=context.args[0].lstrip('@') if context.args else None
     if username:
-        target=get_spam_optin_target(owner_id, username)
+        targets=find_target_accounts(owner_id, username)
+        target=targets[0] if targets else None
         if not target:
             await update.effective_chat.send_message('Активної розсилки для цього користувача не знайдено.')
             return
@@ -1034,6 +1159,9 @@ async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_chat.send_message('Не знайшов цього користувача у збережених повідомленнях. Спочатку він має надіслати хоча б одне повідомлення.')
         return
     target=dict(targets[0])
+    if is_function_blocked(target['target_user_id']):
+        await update.effective_chat.send_message(f'БЛОК. На @{username} не можна застосовувати цю функцію.')
+        return
     set_pending_mute(owner_id, {'target':target,'duration_seconds':None,'public_notice':None})
     kb=InlineKeyboardMarkup([[InlineKeyboardButton('Поки не буде знято',callback_data='mute_perm'),InlineKeyboardButton('На час',callback_data='mute_time')]])
     await update.effective_chat.send_message(f"Оберіть бажану секцію для видачі муту користувачу @{username}",reply_markup=kb)
@@ -1387,7 +1515,9 @@ def main():
     app.add_handler(CommandHandler("unmute", unmute_command), group=0)
     app.add_handler(CommandHandler("mute_log", mute_log_command), group=0)
     app.add_handler(CommandHandler("spam", spam_command), group=0)
+    app.add_handler(CommandHandler("setacc", setacc_command), group=0)
     app.add_handler(CommandHandler("unspam", unspam_command), group=0)
+    app.add_handler(CommandHandler("block_f", block_f_command), group=0)
     app.add_handler(CallbackQueryHandler(mute_callback, pattern=r"^mute_(?:perm|time|public|private)$"), group=0)
     app.add_handler(CallbackQueryHandler(mute_expiration_callback, pattern=r"^mute_exp_(?:yes|no):\d+$"), group=0)
     app.add_handler(TypeHandler(Update, handle_update), group=1)
