@@ -21,7 +21,7 @@ DATA_DIR = os.getenv("ROMAGRAM_DATA_DIR", "data")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HUB_CHAT_ID = int(os.getenv("ROMAGRAM_HUB_CHAT_ID", "8215352323"))
-SPAM_MAX = 10
+SPAM_MAX = 10000
 INTERAVAL = 0.7
 
 logging.basicConfig(
