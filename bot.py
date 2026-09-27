@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
@@ -29,6 +30,7 @@ log = logging.getLogger("RomaGram")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 connections = {}
+spam_tasks = {}
 
 
 def pg_conn():
@@ -162,6 +164,29 @@ def init_db():
             public_notice BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL,
             UNIQUE(owner_id, business_connection_id, chat_id, target_user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mute_expiration_notifications (
+            mute_id BIGINT PRIMARY KEY,
+            owner_id BIGINT NOT NULL,
+            business_connection_id TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            target_username TEXT,
+            target_name TEXT,
+            created_at TIMESTAMPTZ NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS spam_optins (
+            owner_id BIGINT NOT NULL,
+            business_connection_id TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            target_user_id BIGINT NOT NULL,
+            target_username TEXT,
+            target_name TEXT,
+            created_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY(owner_id, business_connection_id, chat_id, target_user_id)
         )
     """)
     cur.execute("""
@@ -724,6 +749,123 @@ def find_target_accounts(owner_id, username):
     rows = cur.fetchall(); cur.close(); con.close(); return rows
 
 
+def set_spam_optin(owner_id, connection_id, chat_id, user_id, username, name):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""INSERT INTO spam_optins(owner_id,business_connection_id,chat_id,target_user_id,target_username,target_name,created_at)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT(owner_id,business_connection_id,chat_id,target_user_id) DO UPDATE SET target_username=EXCLUDED.target_username,target_name=EXCLUDED.target_name""",
+                (owner_id,connection_id,chat_id,user_id,username,name,now()))
+    con.commit(); cur.close(); con.close()
+
+
+def remove_spam_optin(owner_id, username):
+    u=username.lstrip('@').lower()
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("DELETE FROM spam_optins WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s", (owner_id,u))
+    n=cur.rowcount; con.commit(); cur.close(); con.close(); return n
+
+
+def get_spam_optin_target(owner_id, username):
+    u=username.lstrip('@').lower()
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("""SELECT * FROM spam_optins WHERE owner_id=%s AND LOWER(COALESCE(target_username,''))=%s
+                   ORDER BY created_at DESC LIMIT 1""", (owner_id,u))
+    row=cur.fetchone(); cur.close(); con.close(); return row
+
+
+def is_spam_opted_in(owner_id, connection_id, chat_id, user_id):
+    con=pg_conn(); cur=con.cursor()
+    cur.execute("SELECT 1 FROM spam_optins WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND target_user_id=%s", (owner_id,connection_id,chat_id,user_id))
+    row=cur.fetchone(); cur.close(); con.close(); return bool(row)
+
+
+def parse_spam_count(raw):
+    try:
+        n=int(raw)
+    except (TypeError,ValueError):
+        return None
+    if n < 1 or n > 10:
+        return None
+    return n
+
+
+async def spam_worker(bot, owner_id, target, count, text, task_key):
+    sent=0
+    try:
+        for i in range(count):
+            if spam_tasks.get(task_key) is not asyncio.current_task():
+                return
+            await bot.send_message(chat_id=target['chat_id'], text=text, business_connection_id=target['business_connection_id'])
+            sent += 1
+            if i < count - 1:
+                await asyncio.sleep(0.7)
+        await bot.send_message(chat_id=owner_id, text=f'Готово: надіслано {sent} повідомлень користувачу @{target["target_username"]}.')
+    except asyncio.CancelledError:
+        raise
+    except TelegramError as e:
+        await bot.send_message(chat_id=owner_id, text=f'Розсилку зупинено після {sent} повідомлень: Telegram не дозволив надіслати наступне повідомлення.')
+        log.error('Spam worker TelegramError: %s', e)
+    finally:
+        if spam_tasks.get(task_key) is asyncio.current_task():
+            spam_tasks.pop(task_key, None)
+
+
+async def spam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    owner_id=update.effective_user.id
+    if len(context.args) < 3 or not context.args[0].startswith('@'):
+        await update.effective_chat.send_message('Використання: /spam @username 10 text\nКористувач має попередньо надіслати /spam_accept у чаті.')
+        return
+    username=context.args[0].lstrip('@')
+    count=parse_spam_count(context.args[1])
+    text=' '.join(context.args[2:]).strip()
+    if not count:
+        await update.effective_chat.send_message('Кількість має бути від 1 до 10.')
+        return
+    if not text:
+        await update.effective_chat.send_message('Текст повідомлення не може бути порожнім.')
+        return
+    target=get_spam_optin_target(owner_id, username)
+    if not target:
+        await update.effective_chat.send_message('Цей користувач не підтвердив отримання повторних повідомлень. Нехай він надішле /spam_accept у чаті.')
+        return
+    task_key=(owner_id, target['business_connection_id'], target['chat_id'], target['target_user_id'])
+    old=spam_tasks.get(task_key)
+    if old and not old.done():
+        old.cancel()
+    task=asyncio.create_task(spam_worker(context.bot, owner_id, target, count, text, task_key))
+    spam_tasks[task_key]=task
+    await update.effective_chat.send_message(chat_id=update.effective_chat.id, text=f'Запущено: @{username} — {count} повідомлень з інтервалом 0,7 с.')
+
+
+async def unspam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    owner_id=update.effective_user.id
+    username=context.args[0].lstrip('@') if context.args else None
+    if username:
+        target=get_spam_optin_target(owner_id, username)
+        if not target:
+            await update.effective_chat.send_message('Активної розсилки для цього користувача не знайдено.')
+            return
+        task_key=(owner_id, target['business_connection_id'], target['chat_id'], target['target_user_id'])
+        task=spam_tasks.get(task_key)
+        if task and not task.done():
+            task.cancel()
+            spam_tasks.pop(task_key, None)
+            await update.effective_chat.send_message(f'Розсилку для @{username} зупинено.')
+        else:
+            await update.effective_chat.send_message(f'Активної розсилки для @{username} немає.')
+        return
+    keys=[k for k in spam_tasks if k[0]==owner_id]
+    for key in keys:
+        task=spam_tasks.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+    await update.effective_chat.send_message(f'Зупинено активних розсилок: {len(keys)}.')
+
+
 def get_pending_mute(owner_id):
     con = pg_conn(); cur = con.cursor()
     cur.execute("SELECT * FROM settings WHERE owner_id=%s AND key='pending_mute'", (owner_id,))
@@ -755,6 +897,15 @@ def parse_duration(value):
     for n, unit in re.findall(r'(\d+)([dhms])', value):
         total += int(n) * {'d':86400,'h':3600,'m':60,'s':1}[unit]
     return total if total > 0 else None
+
+
+def format_expiry_local(dt):
+    if not dt:
+        return ''
+    try:
+        return dt.astimezone(ZoneInfo('Europe/Kyiv')).strftime('%d.%m.%Y %H:%M')
+    except Exception:
+        return dt.strftime('%d.%m.%Y %H:%M')
 
 
 def human_duration(seconds):
@@ -859,7 +1010,7 @@ async def finish_mute(bot, owner_id, pending, duration_seconds, public_notice):
     if public_notice:
         if bc:
             if duration_seconds:
-                text=f"Вам було видано мут на {human_duration(duration_seconds)}!"
+                text=f"Вам було видано мут на {human_duration(duration_seconds)}!\nМут закінчиться: {format_expiry_local(expires)}"
             else:
                 text="Вам було видано мут!"
             try:
@@ -913,7 +1064,7 @@ async def mute_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Оберіть спосіб видачі муту користувачу @{pending['target']['target_username']}",reply_markup=kb)
     elif q.data == 'mute_time':
         pending['duration_seconds']='waiting'; set_pending_mute(owner_id,pending)
-        await q.edit_message_text('Введіть час муту у форматі, наприклад: 10d5h2m1s')
+        await q.edit_message_text('Введіть час муту у форматі, наприклад: \"10d5h2m1s\" - 10 днів, 5 годин, 2 хвилини, 1 секунда.\nФормат: d - дні, h - години, m - хвилини, s - секунди.')
     elif q.data in ('mute_public','mute_private'):
         if pending.get('duration_seconds') == 'waiting':
             await q.edit_message_text('Спочатку введіть тривалість муту, наприклад: 10d5h2m1s'); return
@@ -927,7 +1078,7 @@ async def mute_duration_message(update: Update, context: ContextTypes.DEFAULT_TY
     if not pending or pending.get('duration_seconds') != 'waiting': return False
     seconds=parse_duration(update.message.text)
     if not seconds:
-        await update.effective_chat.send_message('Невірний формат. Приклад: 10d5h2m1s'); return True
+        await update.effective_chat.send_message('Невірний формат. Приклад: \"10d5h2m1s\" - 10 днів, 5 годин, 2 хвилини, 1 секунда.\nФормат: d - дні, h - години, m - хвилини, s - секунди.'); return True
     pending['duration_seconds']=seconds; set_pending_mute(owner_id,pending)
     kb=InlineKeyboardMarkup([[InlineKeyboardButton('Публічно',callback_data='mute_public'),InlineKeyboardButton('Приватно',callback_data='mute_private')]])
     await update.effective_chat.send_message('Оберіть спосіб видачі муту:',reply_markup=kb); return True
@@ -1016,6 +1167,24 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not owner_id:
                 return
             account_name = account_name_for(bc)
+            if m.from_user and m.text:
+                command_text = m.text.strip().split()[0].lower() if m.text.strip() else ''
+                if command_text == '/spam_accept':
+                    set_spam_optin(owner_id, connection_id, m.chat.id, m.from_user.id, m.from_user.username, m.from_user.full_name)
+                    try:
+                        await context.bot.send_message(chat_id=m.chat.id, text='Повторні повідомлення дозволено. Ви можете скасувати дозвіл командою /spam_revoke.', business_connection_id=connection_id)
+                    except TelegramError as e:
+                        log.error('Не вдалося підтвердити spam opt-in: %s', e)
+                    return
+                if command_text == '/spam_revoke':
+                    con=pg_conn(); cur=con.cursor()
+                    cur.execute('DELETE FROM spam_optins WHERE owner_id=%s AND business_connection_id=%s AND chat_id=%s AND target_user_id=%s', (owner_id,connection_id,m.chat.id,m.from_user.id))
+                    con.commit(); cur.close(); con.close()
+                    try:
+                        await context.bot.send_message(chat_id=m.chat.id, text='Повторні повідомлення вимкнено.', business_connection_id=connection_id)
+                    except TelegramError as e:
+                        log.error('Не вдалося підтвердити spam revoke: %s', e)
+                    return
             mute = active_mute(owner_id, connection_id, m.chat.id, m.from_user.id if m.from_user else 0)
             if mute:
                 save_message(owner_id, connection_id, m)
@@ -1081,13 +1250,105 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Помилка обробки update: %s", e)
 
 
+async def mute_expiration_worker(app: Application):
+    while True:
+        try:
+            con = pg_conn()
+            cur = con.cursor()
+            cur.execute("""
+                SELECT id, owner_id, business_connection_id, chat_id, target_user_id, target_username, target_name, expires_at
+                FROM mutes
+                WHERE expires_at IS NOT NULL AND expires_at <= NOW()
+                ORDER BY expires_at ASC
+            """)
+            rows = cur.fetchall()
+            for row in rows:
+                cur.execute("""
+                    INSERT INTO mute_expiration_notifications(mute_id, owner_id, business_connection_id, chat_id, target_username, target_name, created_at)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(mute_id) DO UPDATE SET owner_id=EXCLUDED.owner_id, business_connection_id=EXCLUDED.business_connection_id, chat_id=EXCLUDED.chat_id, target_username=EXCLUDED.target_username, target_name=EXCLUDED.target_name
+                """, (row["id"], row["owner_id"], row["business_connection_id"], row["chat_id"], row.get("target_username"), row.get("target_name"), now()))
+                cur.execute("DELETE FROM mutes WHERE id=%s", (row["id"],))
+            con.commit()
+            cur.close()
+            con.close()
+
+            for row in rows:
+                username = "@" + row["target_username"] if row.get("target_username") else (row.get("target_name") or "ID " + str(row["target_user_id"]))
+                expires_text = format_expiry_local(row.get("expires_at"))
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Повідомити користувача", callback_data=f"mute_exp_yes:{row['id']}"),
+                    InlineKeyboardButton("Не повідомляти користувача", callback_data=f"mute_exp_no:{row['id']}")
+                ]])
+                try:
+                    await app.bot.send_message(
+                        chat_id=row["owner_id"],
+                        text=f"Мут на {username} закінчився.\nТочний час завершення: {expires_text}",
+                        reply_markup=kb
+                    )
+                except TelegramError as e:
+                    log.error("Не вдалося повідомити про завершення муту для owner_id=%s: %s", row["owner_id"], e)
+        except Exception as e:
+            log.exception("Помилка перевірки завершення мутів: %s", e)
+        await asyncio.sleep(1)
+
+
+async def mute_expiration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ''
+    try:
+        action, raw_id = data.split(':', 1)
+        mute_id = int(raw_id)
+    except (ValueError, AttributeError):
+        await q.edit_message_text('Некоректний запит.')
+        return
+    con = pg_conn()
+    cur = con.cursor()
+    cur.execute("SELECT owner_id, business_connection_id, chat_id, target_username, target_name FROM mute_expiration_notifications WHERE mute_id=%s", (mute_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.close(); con.close()
+        await q.edit_message_text('Дані про завершений мут вже недоступні.')
+        return
+    if row['owner_id'] != q.from_user.id:
+        cur.close(); con.close()
+        await q.answer('Це повідомлення призначене іншому користувачу.', show_alert=True)
+        return
+    username = '@' + row['target_username'] if row.get('target_username') else (row.get('target_name') or 'користувача')
+    if action == 'mute_exp_yes':
+        bc = connections.get(row['business_connection_id']) or await get_connection(context.bot, row['business_connection_id'])
+        if not bc or not bc.is_enabled:
+            cur.close(); con.close()
+            await q.edit_message_text('Не вдалося повідомити користувача: Business-акаунт недоступний.')
+            return
+        try:
+            await context.bot.send_message(chat_id=row['chat_id'], text='Мут завершився.', business_connection_id=row['business_connection_id'])
+            await q.edit_message_text(f'Мут на {username} завершився. Користувача повідомлено.')
+        except TelegramError as e:
+            log.error('Не вдалося повідомити користувача після завершення муту: %s', e)
+            await q.edit_message_text(f'Мут на {username} завершився, але повідомити користувача не вдалося.')
+    else:
+        await q.edit_message_text(f'Мут на {username} завершився. Користувача не повідомлено.')
+    cur.execute("DELETE FROM mute_expiration_notifications WHERE mute_id=%s", (mute_id,))
+    con.commit(); cur.close(); con.close()
+
+
 async def post_init(app: Application):
     log.info("RomaGram запускається...")
     await app.bot.delete_webhook(drop_pending_updates=False)
+    app.bot_data["mute_expiration_task"] = asyncio.create_task(mute_expiration_worker(app))
     log.info("Webhook видалено, polling готовий")
 
 
 async def post_shutdown(app: Application):
+    task = app.bot_data.pop("mute_expiration_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     log.info("RomaGram зупинено")
 
 
@@ -1123,7 +1384,10 @@ def main():
     app.add_handler(CommandHandler("mute", mute_command), group=0)
     app.add_handler(CommandHandler("unmute", unmute_command), group=0)
     app.add_handler(CommandHandler("mute_log", mute_log_command), group=0)
+    app.add_handler(CommandHandler("spam", spam_command), group=0)
+    app.add_handler(CommandHandler("unspam", unspam_command), group=0)
     app.add_handler(CallbackQueryHandler(mute_callback, pattern=r"^mute_(?:perm|time|public|private)$"), group=0)
+    app.add_handler(CallbackQueryHandler(mute_expiration_callback, pattern=r"^mute_exp_(?:yes|no):\d+$"), group=0)
     app.add_handler(TypeHandler(Update, handle_update), group=1)
     app.add_handler(TypeHandler(Update, mute_duration_message), group=2)
 
