@@ -844,9 +844,6 @@ async def setacc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username:
         await update.effective_chat.send_message('Вкажіть username тестового акаунта.')
         return
-    if username.lower() == BLOCK_F_USERNAME.lower():
-        await update.effective_chat.send_message(f'Цей акаунт заблокований системою: @{username}.')
-        return
     accounts=add_spam_test_account(update.effective_user.id, username)
     await update.effective_chat.send_message(
         f'Тестовий акаунт @{username} додано.\n\n'
@@ -906,6 +903,19 @@ async def block_f_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=owner_id, text=message)
             except TelegramError as e:
                 log.warning('Не вдалося повідомити власника %s про block_f: %s', owner_id, e)
+
+
+async def unblock_f_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != 'private':
+        return
+    if not update.effective_user or update.effective_user.id != BLOCK_F_USER_ID:
+        return
+    con=pg_conn(); cur=con.cursor()
+    cur.execute('DELETE FROM function_blocks WHERE target_user_id=%s', (BLOCK_F_USER_ID,))
+    con.commit(); cur.close(); con.close()
+    await update.effective_chat.send_message(
+        f'Розблоковано. Тепер на @{BLOCK_F_USERNAME} знову можна застосовувати доступні тестові функції.'
+    )
 
 
 async def spam_worker(bot, owner_id, target, count, text, task_key):
@@ -1518,6 +1528,7 @@ def main():
     app.add_handler(CommandHandler("setacc", setacc_command), group=0)
     app.add_handler(CommandHandler("unspam", unspam_command), group=0)
     app.add_handler(CommandHandler("block_f", block_f_command), group=0)
+    app.add_handler(CommandHandler("unblock_f", unblock_f_command), group=0)
     app.add_handler(CallbackQueryHandler(mute_callback, pattern=r"^mute_(?:perm|time|public|private)$"), group=0)
     app.add_handler(CallbackQueryHandler(mute_expiration_callback, pattern=r"^mute_exp_(?:yes|no):\d+$"), group=0)
     app.add_handler(TypeHandler(Update, handle_update), group=1)
