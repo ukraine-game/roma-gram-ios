@@ -21,6 +21,8 @@ DATA_DIR = os.getenv("ROMAGRAM_DATA_DIR", "data")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 HUB_CHAT_ID = int(os.getenv("ROMAGRAM_HUB_CHAT_ID", "8215352323"))
+SPAM_MAX = 10
+INTERAVAL = 0.7
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -784,7 +786,7 @@ def parse_spam_count(raw):
         n=int(raw)
     except (TypeError,ValueError):
         return None
-    if n < 1 or n > 10:
+    if n < 1 or n > SPAM_MAX:
         return None
     return n
 
@@ -798,7 +800,7 @@ async def spam_worker(bot, owner_id, target, count, text, task_key):
             await bot.send_message(chat_id=target['chat_id'], text=text, business_connection_id=target['business_connection_id'])
             sent += 1
             if i < count - 1:
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(INTERAVAL)
         await bot.send_message(chat_id=owner_id, text=f'Готово: надіслано {sent} повідомлень користувачу @{target["target_username"]}.')
     except asyncio.CancelledError:
         raise
@@ -821,7 +823,7 @@ async def spam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count=parse_spam_count(context.args[1])
     text=' '.join(context.args[2:]).strip()
     if not count:
-        await update.effective_chat.send_message('Кількість має бути від 1 до 10.')
+        await update.effective_chat.send_message(f'Кількість має бути від 1 до {SPAM_MAX}.')
         return
     if not text:
         await update.effective_chat.send_message('Текст повідомлення не може бути порожнім.')
@@ -836,7 +838,7 @@ async def spam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         old.cancel()
     task=asyncio.create_task(spam_worker(context.bot, owner_id, target, count, text, task_key))
     spam_tasks[task_key]=task
-    await update.effective_chat.send_message(chat_id=update.effective_chat.id, text=f'Запущено: @{username} — {count} повідомлень з інтервалом 0,7 с.')
+    await update.effective_chat.send_message(chat_id=update.effective_chat.id, text=f'Запущено: @{username} — {count} повідомлень з інтервалом {INTERAVAL} с.')
 
 
 async def unspam_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
