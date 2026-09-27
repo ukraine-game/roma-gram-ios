@@ -444,7 +444,17 @@ async def send_deleted_media(bot, owner_chat_id, row):
 
 
 def is_ephemeral_message(m):
-    return bool(getattr(m, "ephemeral_message_id", None)) or getattr(m, "message_id", None) == 0
+    return getattr(m, "ephemeral_message_id", None) is not None
+
+
+def telegram_user_tag(user, fallback_id=None):
+    if user and getattr(user, "username", None):
+        return f"@{user.username}"
+    if user and getattr(user, "full_name", None):
+        return user.full_name
+    if fallback_id is not None:
+        return f"ID {fallback_id}"
+    return "Невідомий користувач"
 
 
 def save_ephemeral_message(owner_id, bc, account_name, m):
@@ -607,13 +617,12 @@ def save_edit_log(bc, account_name, m, old_row):
 
 
 async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
-    editor = m.from_user
-    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else str(m.chat.id))
-    chat_tag = f"@{m.chat.username}" if getattr(m.chat, "username", None) else editor_tag
+    account_tag = telegram_user_tag(bc.user, getattr(bc, "user_chat_id", None))
+    chat_tag = telegram_user_tag(m.chat, m.chat.id if m.chat else None)
     old_text = old_content or "[без тексту]"
     new_text = new_content or "[без тексту]"
     text = (
-        f"Було змінено повідомлення в чаті {chat_tag}\n\n"
+        f"Було змінено повідомлення в чаті між {account_tag} та {chat_tag}\n\n"
         f"Було: {old_text}\n"
         f"Стало: {new_text}"
     )
@@ -624,8 +633,7 @@ async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
 
 
 async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content):
-    chat_user = m.chat
-    chat_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or (f"@{m.from_user.username}" if m.from_user and m.from_user.username else str(chat_user.id)))
+    chat_tag = telegram_user_tag(m.chat, m.chat.id if m.chat else None)
     old_text = old_content or "[без тексту]"
     new_text = new_content or "[без тексту]"
     text = (
@@ -820,9 +828,11 @@ def main():
         .build()
     )
 
-    app.add_handler(TypeHandler(Update, handle_update), group=0)
+    app.add_handler(CommandHandler("start", start_command), group=0)
+    app.add_handler(TypeHandler(Update, handle_update), group=1)
 
     allowed = [
+        "message",
         "business_connection",
         "business_message",
         "edited_business_message",
