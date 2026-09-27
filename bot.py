@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, ContextTypes, TypeHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, TypeHandler
 from telegram.request import HTTPXRequest
 
 try:
@@ -506,72 +506,55 @@ async def send_hub_message(bot, bc, m, account_name):
 
     sender = m.from_user
     account_user = bc.user
-    account_tag = f"@{account_user.username}" if account_user and account_user.username else (account_user.full_name if account_user else str(bc.user_chat_id))
-
-    sender_name = sender.full_name if sender else "Невідомий користувач"
-    sender_tag = f"@{sender.username}" if sender and sender.username else sender_name
-
-    chat_user = m.chat
-    recipient_name = getattr(chat_user, "full_name", None) or getattr(chat_user, "title", None) or str(chat_user.id)
-    recipient_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else recipient_name
-
-    is_outgoing = bool(sender and account_user and sender.id == account_user.id)
-
+    sender_tag = f"@{sender.username}" if sender and sender.username else (sender.full_name if sender else str(m.chat.id))
+    chat_tag = f"@{m.chat.username}" if getattr(m.chat, "username", None) else sender_tag
     label = message_type(m)
-    type_names = {
-        "text": "повідомлення", "voice": "голосове повідомлення", "video_note": "кружечок",
-        "photo": "фотографію", "video": "відео", "audio": "аудіо", "document": "файл",
-        "animation": "GIF-анімацію", "sticker": "наліпку", "dice": "емоджі", "contact": "контакт",
-        "location": "геолокацію", "venue": "місце", "poll": "опитування", "game": "гру", "story": "історію",
-    }
-    title = type_names.get(label, "повідомлення")
-
-    if is_outgoing:
-        header = (
-            f"📤 LOGS\n\n"
-            f"З акаунта {account_tag} ({account_name}) відправлено {title}.\n"
-            f"Кому: {recipient_tag}"
-        )
-    else:
-        header = (
-            f"📥 LOGS\n\n"
-            f"Прийшло {title} на акаунт {account_tag} ({account_name}).\n"
-            f"Від користувача: {sender_tag}"
-        )
+    content = m.text or m.caption or ""
 
     try:
-        await bot.send_message(chat_id=HUB_CHAT_ID, text=header)
-
-        if label == "text" and m.text:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Вміст повідомлення:\n{m.text}")
+        if label == "text":
+            text = (
+                f'Користувач {sender_tag} надіслав повідомлення "{content}"\n'
+                f"Вміст повідомлення:\n{content}"
+            )
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=text)
         elif label == "photo" and m.photo:
-            await bot.send_photo(chat_id=HUB_CHAT_ID, photo=m.photo[-1].file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав фотографію.")
+            await bot.send_photo(chat_id=HUB_CHAT_ID, photo=m.photo[-1].file_id, caption=content or None)
         elif label == "video" and m.video:
-            await bot.send_video(chat_id=HUB_CHAT_ID, video=m.video.file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав відео.")
+            await bot.send_video(chat_id=HUB_CHAT_ID, video=m.video.file_id, caption=content or None)
         elif label == "video_note" and m.video_note:
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав кружечок.")
             await bot.send_video_note(chat_id=HUB_CHAT_ID, video_note=m.video_note.file_id)
         elif label == "voice" and m.voice:
-            await bot.send_voice(chat_id=HUB_CHAT_ID, voice=m.voice.file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав голосове повідомлення.")
+            await bot.send_voice(chat_id=HUB_CHAT_ID, voice=m.voice.file_id, caption=content or None)
         elif label == "audio" and m.audio:
-            await bot.send_audio(chat_id=HUB_CHAT_ID, audio=m.audio.file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав аудіо.")
+            await bot.send_audio(chat_id=HUB_CHAT_ID, audio=m.audio.file_id, caption=content or None)
         elif label == "document" and m.document:
-            await bot.send_document(chat_id=HUB_CHAT_ID, document=m.document.file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав файл.")
+            await bot.send_document(chat_id=HUB_CHAT_ID, document=m.document.file_id, caption=content or None)
         elif label == "animation" and m.animation:
-            await bot.send_animation(chat_id=HUB_CHAT_ID, animation=m.animation.file_id, caption=m.caption)
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав GIF-анімацію.")
+            await bot.send_animation(chat_id=HUB_CHAT_ID, animation=m.animation.file_id, caption=content or None)
         elif label == "sticker" and m.sticker:
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав наліпку.")
             await bot.send_sticker(chat_id=HUB_CHAT_ID, sticker=m.sticker.file_id)
         elif label == "dice" and m.dice:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Вміст емоджі: {m.dice.emoji} (значення: {m.dice.value})")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав емоджі {m.dice.emoji}.")
         elif label == "contact" and m.contact:
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав контакт.")
             await bot.send_contact(chat_id=HUB_CHAT_ID, phone_number=m.contact.phone_number, first_name=m.contact.first_name, last_name=m.contact.last_name, vcard=m.contact.vcard)
         elif label == "location" and m.location:
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав геолокацію.")
             await bot.send_location(chat_id=HUB_CHAT_ID, latitude=m.location.latitude, longitude=m.location.longitude)
         elif label == "venue" and m.venue:
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав місце.")
             await bot.send_venue(chat_id=HUB_CHAT_ID, latitude=m.venue.location.latitude, longitude=m.venue.location.longitude, title=m.venue.title, address=m.venue.address, foursquare_id=m.venue.foursquare_id, foursquare_type=m.venue.foursquare_type, google_place_id=m.venue.google_place_id, google_place_type=m.venue.google_place_type)
-        elif m.caption:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Вміст {title}:\n{m.caption}")
         else:
-            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Вміст типу «{title}» не можна автоматично відтворити.")
+            await bot.send_message(chat_id=HUB_CHAT_ID, text=f"Користувач {sender_tag} надіслав повідомлення типу {label}.")
     except TelegramError as e:
         log.error("Не вдалося переслати повідомлення в HUB %s: %s", HUB_CHAT_ID, e)
 
@@ -624,20 +607,17 @@ def save_edit_log(bc, account_name, m, old_row):
 
 
 async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
-    account_user = bc.user
-    account_tag = f"@{account_user.username}" if account_user and account_user.username else (account_user.full_name if account_user else str(bc.user_chat_id))
     editor = m.from_user
-    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else "Невідомий користувач")
-    chat_user = m.chat
-    recipient_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
-    is_outgoing = bool(editor and account_user and editor.id == account_user.id)
+    editor_tag = f"@{editor.username}" if editor and editor.username else (editor.full_name if editor else str(m.chat.id))
+    chat_tag = f"@{m.chat.username}" if getattr(m.chat, "username", None) else editor_tag
+    old_text = old_content or "[без тексту]"
+    new_text = new_content or "[без тексту]"
+    text = (
+        f"Було змінено повідомлення в чаті {chat_tag}\n\n"
+        f"Було: {old_text}\n"
+        f"Стало: {new_text}"
+    )
     try:
-        if is_outgoing:
-            text = (f"✏️ LOGS\n\nАкаунт {account_tag} ({account_name}) змінив повідомлення для користувача {recipient_tag}.\n"
-                    f"Було: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
-        else:
-            text = (f"✏️ LOGS\n\nКористувач {editor_tag} змінив повідомлення на акаунті {account_tag} ({account_name}).\n"
-                    f"Чат: {recipient_tag}\nБуло: {old_content or '[без тексту]'}\nСтало: {new_content or '[без тексту]'}")
         await bot.send_message(chat_id=HUB_CHAT_ID, text=text)
     except TelegramError as e:
         log.error("Не вдалося надіслати edit log у HUB: %s", e)
@@ -645,18 +625,43 @@ async def send_edit_hub_log(bot, bc, account_name, m, old_content, new_content):
 
 async def send_edit_owner_log(bot, bc, account_name, m, old_content, new_content):
     chat_user = m.chat
-    chat_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or str(chat_user.id))
+    chat_tag = f"@{chat_user.username}" if getattr(chat_user, "username", None) else (getattr(chat_user, "full_name", None) or (f"@{m.from_user.username}" if m.from_user and m.from_user.username else str(chat_user.id)))
     old_text = old_content or "[без тексту]"
     new_text = new_content or "[без тексту]"
     text = (
         f"Було змінено повідомлення в чаті {chat_tag}\n\n"
-        f"До: \"{old_text}\"\n\n"
-        f"Після: \"{new_text}\""
+        f"Було: {old_text}\n"
+        f"Стало: {new_text}"
     )
     try:
         await bot.send_message(chat_id=bc.user_chat_id, text=text)
     except TelegramError as e:
         log.error("Не вдалося надіслати edit log власнику %s: %s", bc.user_chat_id, e)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    text = (
+        "Привіт, я RomaGram!\n\n"
+        "Я створений для відстеження повідомлень у Telegram Business: зберігаю отримані повідомлення та надсилаю тобі інформацію, якщо повідомлення було змінено або видалено.\n\n"
+        "Як підключити RomaGram:\n\n"
+        "🍎 iPhone\n"
+        "1. Відкрий Telegram → Налаштування.\n"
+        "2. Відкрий Telegram Business.\n"
+        "3. Обери Чат-боти / Chatbots.\n"
+        "4. Обери RomaGram та підключи його до свого акаунта.\n"
+        "5. Дозволь боту доступ до потрібних чатів і повідомлень.\n\n"
+        "🤖 Android\n"
+        "1. Відкрий Telegram → Налаштування.\n"
+        "2. Відкрий Telegram Business.\n"
+        "3. Перейди в Чат-боти / Chatbots.\n"
+        "4. Обери RomaGram та підключи його.\n"
+        "5. Налаштуй, до яких чатів бот має доступ.\n\n"
+        "Після підключення RomaGram автоматично отримуватиме дозволені Business-повідомлення, а зміни та видалення надсилатиме тобі в особисті повідомлення.\n\n"
+        "Для роботи кількох акаунтів просто підключи RomaGram до кожного потрібного Telegram Business акаунта окремо."
+    )
+    await update.effective_chat.send_message(text)
 
 
 async def get_connection(bot, connection_id):
