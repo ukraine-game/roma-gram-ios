@@ -855,7 +855,7 @@ async def ignore_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     for target in targets:
         set_ignore_rule(owner_id, target["business_connection_id"], target["chat_id"], target["sender_id"], target["sender_username"], True)
-    await update.effective_chat.send_message(f"Увімкнено ignore для @{username}. Нові повідомлення автоматично позначатимуться прочитаними та надсилатимуться тобі в ЛС.")
+    await update.effective_chat.send_message(f"Увімкнено ignore для @{username}. Нові повідомлення надсилатимуться тобі в ЛС без позначення прочитаними.")
 
 
 async def ignore_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -976,8 +976,7 @@ async def handle_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             for rule in ignore_rules:
                 if m.message_id:
-                    await mark_business_message_read(context.bot, connection_id, m.chat.id, m.message_id)
-                await send_message_copy(context.bot, bc.user_chat_id, m)
+                    await send_message_copy(context.bot, bc.user_chat_id, m)
             await send_hub_message(context.bot, bc, m, account_name)
             log.info("Business message: connection=%s account=%s chat=%s message_id=%s type=%s saved=%s hub=%s text=%r", connection_id, account_name, m.chat.id, m.message_id, message_type(m), ok, HUB_CHAT_ID, m.text or m.caption)
             return
